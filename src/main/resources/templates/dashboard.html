@@ -221,7 +221,10 @@ async function gossip() {
 }
 
 async function flushBridges() {
-    const r = await fetch('/api/mesh/flush', {method: 'POST'}).then(r => r.json());
+    const r = await fetch('/api/mesh/flush', {
+    method: 'POST',
+    headers: { "X-Bridge-Api-Key": "demo-key-12345" }
+}).then(r => r.json());
     log(`📡 ${r.uploadsAttempted} bridge upload(s):`);
     r.results.forEach(res => {
         log(`   ${res.bridgeNode} packet ${res.packetId} → ${res.outcome}` +
