@@ -4,6 +4,9 @@ A Spring Boot backend that demonstrates **offline UPI payments routed through a 
 
 This repo is the **server side** of that system, plus a software simulator of the mesh so you can demo the whole flow on a single laptop without any real Bluetooth hardware.
 
+🔗 **Live demo:** `https://<your-render-service>.onrender.com` *(replace with your actual Render URL)*
+Deployed on Render (Docker) with a MySQL database on Railway.
+
 ---
 
 ## Table of Contents
@@ -12,24 +15,26 @@ This repo is the **server side** of that system, plus a software simulator of th
 2. [How to run it](#how-to-run-it)
 3. [The demo flow (step by step)](#the-demo-flow-step-by-step)
 4. [Architecture](#architecture)
-5. [The three hard problems and how they're solved](#the-three-hard-problems-and-how-theyre-solved)
+5. [The four hard problems and how they're solved](#the-four-hard-problems-and-how-theyre-solved)
 6. [File-by-file walkthrough](#file-by-file-walkthrough)
 7. [API reference](#api-reference)
 8. [Tests](#tests)
 9. [What's NOT real (and what would change for production)](#whats-not-real-and-what-would-change-for-production)
 10. [Honest limitations of the concept](#honest-limitations-of-the-concept)
+11. [Deployment](#deployment)
 
 ---
 
 ## What this demo proves
 
-The system shows three things working end to end:
+The system shows four things working end to end:
 
 1. **A payment can travel from sender to backend through untrusted intermediaries** without any of them being able to read or tamper with it. (Hybrid RSA + AES-GCM encryption.)
 2. **Even if the same payment reaches the backend simultaneously through multiple bridge nodes, it settles exactly once.** (Idempotency via atomic compare-and-set on the ciphertext hash.)
 3. **A tampered or replayed packet is rejected** before it touches the ledger.
+4. **Only authenticated bridge nodes can submit packets** — the ingestion endpoint is gated by an API key, not left open.
 
-You'll see all three in the dashboard.
+You'll see all four in the dashboard.
 
 ---
 
@@ -38,17 +43,33 @@ You'll see all three in the dashboard.
 ### Prerequisites
 
 - **JDK 17 or newer** installed and on PATH (or `JAVA_HOME` set). Check with `java -version`.
-- That's it. No database, no Redis, no Maven (the wrapper handles it). Just Java.
+- A **MySQL database** — either a local MySQL instance or a free one on [Railway](https://railway.app).
+- That's it. No Redis, no manual Maven install (the wrapper handles it).
+
+### Set environment variables
+
+This app reads its DB connection and API key from environment variables — it no longer uses an in-memory H2 database. Set these before running:
+
+```
+DB_URL=jdbc:mysql://<host>:<port>/<database>
+DB_USER=<your-mysql-user>
+DB_PASSWORD=<your-mysql-password>
+BRIDGE_API_KEY=<any-shared-secret-string>
+```
+
+On Windows (PowerShell), set them per-session like:
+```powershell
+$env:DB_URL="jdbc:mysql://localhost:3306/upimesh"
+$env:DB_USER="root"
+$env:DB_PASSWORD="yourpassword"
+$env:BRIDGE_API_KEY="demo-key-12345"
+```
 
 ### Run on Windows
-
-Open a terminal in the project folder and run:
 
 ```cmd
 mvnw.cmd spring-boot:run
 ```
-
-The first run downloads Maven (~10 MB) and all dependencies (~80 MB) — give it a couple of minutes. Subsequent runs start in a few seconds.
 
 ### Run on Mac/Linux
 
@@ -109,14 +130,15 @@ In the real system this would happen organically as people walk past each other 
 
 Click **"📡 Bridges Upload to Backend"**.
 
-`phone-bridge` is the only device with `hasInternet=true`. The dashboard simulates that phone walking outside and getting 4G. It POSTs every packet it holds to `/api/bridge/ingest`.
+`phone-bridge` is the only device with `hasInternet=true`. The dashboard simulates that phone walking outside and getting 4G. It POSTs every packet it holds to `/api/bridge/ingest`, attaching the shared `X-Bridge-Api-Key` header.
 
 The backend pipeline runs:
-1. Hash the ciphertext (`SHA-256`).
-2. Try to claim the hash in the idempotency cache.
-3. If claimed: decrypt with the server's RSA private key.
-4. Verify freshness (signedAt within 24 hours).
-5. Run the debit/credit in a single DB transaction.
+1. Verify the `X-Bridge-Api-Key` header matches the configured key — reject with `401` if missing or wrong.
+2. Hash the ciphertext (`SHA-256`).
+3. Try to claim the hash in the idempotency cache.
+4. If claimed: decrypt with the server's RSA private key.
+5. Verify freshness (signedAt within 24 hours).
+6. Run the debit/credit in a single DB transaction.
 
 Watch the **Account Balances** table — money has moved. Watch the **Transaction Ledger** — a new row appears.
 
@@ -155,11 +177,14 @@ This test creates one packet, fires 3 threads at `BridgeIngestionService.ingest(
         │stranger1│ ─────▶ │stranger2│ ─────▶ │ bridge  │ ◀── walks outside
         └─────────┘        └─────────┘        └────┬────┘     gets 4G
                                                    │
-                                                   ▼ HTTPS POST
+                                                   ▼ HTTPS POST + X-Bridge-Api-Key
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                     SPRING BOOT BACKEND (this project)                  │
 │                                                                         │
 │  /api/bridge/ingest                                                     │
+│       │                                                                 │
+│       ▼                                                                 │
+│  [0] BridgeApiKeyFilter — reject if X-Bridge-Api-Key is missing/wrong   │
 │       │                                                                 │
 │       ▼                                                                 │
 │  [1] hash ciphertext (SHA-256)                                          │
@@ -179,12 +204,15 @@ This test creates one packet, fires 3 threads at `BridgeIngestionService.ingest(
 │  [5] SettlementService.settle()                                         │
 │       @Transactional: debit sender, credit receiver, write ledger       │
 │       @Version on Account = optimistic locking (defense in depth)       │
+│       │                                                                 │
+│       ▼                                                                 │
+│  MySQL (Railway) — persists accounts, transactions, ledger              │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## The three hard problems and how they're solved
+## The four hard problems and how they're solved
 
 ### Problem 1: Untrusted intermediates
 
@@ -241,6 +269,16 @@ An attacker who captured a ciphertext weeks ago could replay it whenever conveni
 
 See `BridgeIngestionService.java` for the freshness check.
 
+### Problem 4: An open ingestion endpoint
+
+`/api/bridge/ingest` is the one endpoint real-world bridge devices would hit. Left unauthenticated, anyone who finds the URL could submit arbitrary packets.
+
+**Solution: Shared API key via servlet filter.**
+
+`BridgeApiKeyFilter` runs before the request reaches the controller. It checks for an `X-Bridge-Api-Key` header and compares it against a server-side secret (`BRIDGE_API_KEY` env var). Missing or mismatched key → `401` before any decryption or DB work happens.
+
+This is intentionally simple for a demo. In production this becomes mutual TLS or per-device signed certificates (see the "What's NOT real" table below) — a shared static key doesn't scale to thousands of independent bridge devices, but it correctly demonstrates *that the endpoint is gated*, which is the property that matters for this project.
+
 ---
 
 ## File-by-file walkthrough
@@ -249,10 +287,11 @@ See `BridgeIngestionService.java` for the freshness check.
 upi-offline-mesh/
 ├── pom.xml                                  Maven build, Spring Boot 3.3, Java 17
 ├── mvnw, mvnw.cmd                           Maven wrapper (no install needed)
+├── Dockerfile                                Multi-stage build for Render deployment
 ├── README.md                                this file
 └── src/main/
     ├── resources/
-    │   ├── application.properties           H2 in-memory DB, port 8080, TTLs
+    │   ├── application.properties           MySQL (env-var driven), port 8080, TTLs
     │   └── templates/dashboard.html         The interactive demo UI
     └── java/com/demo/upimesh/
         ├── UpiMeshApplication.java          Spring Boot main class
@@ -282,7 +321,8 @@ upi-offline-mesh/
         │   └── DashboardController.java     Serves the dashboard HTML at /
         │
         └── config/
-            └── AppConfig.java               @EnableScheduling for cache eviction
+            ├── AppConfig.java               @EnableScheduling for cache eviction
+            └── BridgeApiKeyFilter.java      Gates /api/bridge/ingest behind a shared API key
 
 src/test/java/com/demo/upimesh/
 └── IdempotencyConcurrencyTest.java          The 3-bridges-at-once test + tamper test
@@ -303,16 +343,14 @@ src/test/java/com/demo/upimesh/
 | POST | `/api/mesh/gossip` | Run one round of gossip across the mesh |
 | POST | `/api/mesh/flush` | Bridges with internet upload to backend (parallel) |
 | POST | `/api/mesh/reset` | Clear mesh + idempotency cache |
-| POST | `/api/bridge/ingest` | **The production endpoint.** Real bridges POST here |
-| GET | `/h2-console` | Browse the in-memory database |
-
-H2 console login: JDBC URL `jdbc:h2:mem:upimesh`, username `sa`, no password.
+| POST | `/api/bridge/ingest` | **The production endpoint.** Requires `X-Bridge-Api-Key` header. |
 
 ### Request format for `/api/bridge/ingest`
 
 ```http
 POST /api/bridge/ingest
 Content-Type: application/json
+X-Bridge-Api-Key: <shared secret, set via BRIDGE_API_KEY env var>
 X-Bridge-Node-Id: phone-bridge-42
 X-Hop-Count: 3
 
@@ -324,7 +362,7 @@ X-Hop-Count: 3
 }
 ```
 
-Response:
+Response (success):
 ```json
 {
   "outcome": "SETTLED",                     // or "DUPLICATE_DROPPED" or "INVALID"
@@ -333,6 +371,14 @@ Response:
   "transactionId": 42                        // populated on SETTLED
 }
 ```
+
+Response (missing/wrong API key):
+```json
+{
+  "error": "Invalid or missing API key"
+}
+```
+HTTP status `401 Unauthorized`.
 
 ---
 
@@ -353,23 +399,22 @@ The three included tests:
 
 ## What's NOT real (and what would change for production)
 
-This is a teaching demo. To make it production-grade you'd swap these things:
+This is a teaching demo, hardened in a few places but still a demo in others. To make it fully production-grade you'd swap these things:
 
 | What's in the demo | What it would be in production |
 |---|---|
-| H2 in-memory DB | PostgreSQL / MySQL with replicas |
-| `ConcurrentHashMap` for idempotency | Redis with `SET NX EX` |
+| ~~H2 in-memory DB~~ → **MySQL (Railway)** ✅ | PostgreSQL / MySQL with replicas — already true in spirit, would add replicas/backups |
+| ~~No auth on `/api/bridge/ingest`~~ → **Shared API key** ✅ | Mutual TLS or signed bridge-node certificates per device |
+| `ConcurrentHashMap` for idempotency | Redis with `SET NX EX`, shared across replicas |
 | RSA keypair regenerated on every startup | Private key in HSM (AWS KMS, HashiCorp Vault). Public key cached on devices. |
 | Server-side `DemoService.createPacket()` | Same code running on Android, in a Kotlin port |
 | Software-simulated mesh (`MeshSimulatorService`) | Real BLE GATT or Wi-Fi Direct between phones |
 | One settlement service that owns the ledger | Integration with NPCI / a real bank core |
-| No auth on `/api/bridge/ingest` | Mutual TLS or signed bridge-node certificates |
 | In-memory accounts seeded on startup | Real KYC'd users, real VPAs, real PIN verification against the bank |
-| H2 console exposed | Disabled |
 | No rate limiting | Per-bridge-node rate limit, per-sender velocity check |
 | Logs to console | Structured logs to a SIEM, alerts on `INVALID` spikes |
 
-The cryptography and idempotency code is essentially production-shaped. The infrastructure around it is what changes.
+The cryptography, idempotency, persistence, and endpoint auth are now genuinely production-shaped. What remains is mostly the real-device networking layer (BLE/Wi-Fi Direct) and operational hardening (Redis, HSM, rate limiting).
 
 ---
 
@@ -382,7 +427,19 @@ I want this README to be useful to you when someone reviews the project, so let'
 3. **Bluetooth in real life is hard.** Background BLE on Android is heavily throttled since Android 8. iOS peripheral mode is locked down. Two strangers' phones reliably forming a GATT connection while the apps aren't actively open is genuinely difficult and a lot of energy. This demo skips that problem entirely by simulating the mesh.
 4. **Privacy / liability.** A stranger carries your encrypted transaction packet on their phone. They can't read it, but its existence is metadata. In a real deployment you'd want to think about regulatory disclosures and what happens if a device is seized.
 
-For a college / portfolio project: name the concept honestly as **"mesh-routed deferred settlement"** rather than "real-time offline UPI," and you'll have a much stronger pitch. The cryptography and idempotency work here is real engineering and worth showing off.
+For a college / portfolio project: name the concept honestly as **"mesh-routed deferred settlement"** rather than "real-time offline UPI," and you'll have a much stronger pitch. The cryptography, idempotency, and persistence work here is real engineering and worth showing off.
+
+---
+
+## Deployment
+
+This app is deployed using:
+
+- **Backend:** [Render](https://render.com), built via the included `Dockerfile` (multi-stage: Maven build → JRE runtime).
+- **Database:** [Railway](https://railway.app) MySQL, connected via its public TCP proxy.
+- **Environment variables set on Render:** `DB_URL`, `DB_USER`, `DB_PASSWORD`, `BRIDGE_API_KEY`.
+
+To redeploy after changes: push to the connected GitHub branch — Render auto-builds and redeploys.
 
 ---
 
@@ -397,6 +454,10 @@ For a college / portfolio project: name the concept honestly as **"mesh-routed d
 **`mvnw.cmd : The term 'mvnw.cmd' is not recognized`** — On PowerShell you need to prefix with `.\`: `.\mvnw.cmd spring-boot:run`.
 
 **Tests fail intermittently** — The concurrency test is timing-sensitive. If it ever flakes, run it 3x; if it consistently fails on your hardware, file the actual failure output.
+
+**`Communications link failure` on startup** — Your `DB_URL`/`DB_USER`/`DB_PASSWORD` env vars are missing or wrong, or Railway's public networking proxy isn't enabled on the database.
+
+**`401` on `/api/bridge/ingest`** — Check that `BRIDGE_API_KEY` is set the same way in both your environment and the `X-Bridge-Api-Key` header the client sends.
 
 ---
 
